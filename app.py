@@ -27,14 +27,22 @@ def _normalize_spreadsheet_id(value: str) -> str:
 
 
 def _load_service_account_info() -> dict:
+    def _normalize_service_account_info(info: dict) -> dict:
+        normalized = dict(info)
+        private_key = normalized.get("private_key")
+        if isinstance(private_key, str):
+            # Streamlit secrets may contain literal "\n"; convert to real newlines.
+            normalized["private_key"] = private_key.replace("\\n", "\n")
+        return normalized
+
     if "gcp_service_account" in st.secrets:
-        return dict(st.secrets["gcp_service_account"])
+        return _normalize_service_account_info(dict(st.secrets["gcp_service_account"]))
 
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if raw_json:
         import json
 
-        return json.loads(raw_json)
+        return _normalize_service_account_info(json.loads(raw_json))
 
     raise RuntimeError(
         "Missing Google credentials. Add [gcp_service_account] to Streamlit secrets "
