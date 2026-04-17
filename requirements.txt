@@ -1,0 +1,6 @@
+﻿streamlit
+fastapi
+google-cloud-bigquery
+gspread
+pandas
+python-dotenv
