@@ -13,6 +13,23 @@ def _get_gspread_client() -> gspread.Client:
     service_account_info = load_service_account_info()
     return gspread.service_account_from_dict(service_account_info)
 
+
+def _exclude_junk_repair_block(df: pd.DataFrame) -> pd.DataFrame:
+    units_lower = df["unit"].fillna("").astype(str).str.lower()
+    start_matches = units_lower[units_lower.str.contains("2004 isuzu double cab", regex=False)].index.tolist()
+    end_matches = units_lower[units_lower.str.contains("2009 subaru forester", regex=False)].index.tolist()
+
+    if not start_matches or not end_matches:
+        return df
+
+    start_idx = start_matches[0]
+    end_idx = next((idx for idx in end_matches if idx >= start_idx), end_matches[0])
+    if end_idx < start_idx:
+        return df
+
+    return df.drop(index=range(start_idx, end_idx + 1)).reset_index(drop=True)
+
+
 def render_page() -> None:
     st.title("Unit Inquiries (Client and Agent initiated)")
     source = st.secrets["GOOGLE_SHEETS_SPREADSHEET_ID"]
@@ -77,7 +94,7 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    return df.reset_index(drop=True)
+    return _exclude_junk_repair_block(df).reset_index(drop=True)
 
 def main() -> None:
     st.set_page_config(page_title="Unit Inquiries", layout="wide")
