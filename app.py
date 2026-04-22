@@ -1,5 +1,6 @@
 import os
 import re
+import difflib
 
 import gspread
 import pandas as pd
@@ -59,6 +60,65 @@ def _safe_cell(row: list[str], index: int) -> str:
 def _normalize_unit_text(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
     return re.sub(r"\s+", " ", cleaned)
+
+
+def _token_jaccard(a: str, b: str) -> float:
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+    return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
+
+
+def _extract_year_make(key: str) -> tuple[str, str]:
+    tokens = key.split()
+    year = tokens[0] if tokens and re.fullmatch(r"\d{4}", tokens[0]) else ""
+    make = tokens[1] if len(tokens) > 1 else ""
+    return year, make
+
+
+def _fuzzy_match_unit_key(source_key: str, candidate_keys: list[str], threshold: float) -> str | None:
+    if source_key in candidate_keys:
+        return source_key
+
+    source_year, source_make = _extract_year_make(source_key)
+    narrowed = candidate_keys
+    if source_year:
+        narrowed = [k for k in narrowed if _extract_year_make(k)[0] == source_year] or narrowed
+    if source_make:
+        narrowed = [k for k in narrowed if _extract_year_make(k)[1] == source_make] or narrowed
+
+    best_key = None
+    best_score = -1.0
+    for candidate in narrowed:
+        seq = difflib.SequenceMatcher(None, source_key, candidate).ratio()
+        jac = _token_jaccard(source_key, candidate)
+        score = 0.7 * seq + 0.3 * jac
+        if score > best_score:
+            best_key = candidate
+            best_score = score
+
+    if best_key is None:
+        return None
+    return best_key if best_score >= threshold else None
+
+
+def _build_app_counts_exact(reference_keys: pd.Series) -> tuple[pd.Series, int]:
+    counts = reference_keys.value_counts()
+    return counts, 0
+
+
+def _build_app_counts_fuzzy(
+    reference_keys: pd.Series, summary_keys: list[str], threshold: float
+) -> tuple[pd.Series, int]:
+    key_map: dict[str, str | None] = {}
+    for key in reference_keys.unique():
+        key_map[key] = _fuzzy_match_unit_key(key, summary_keys, threshold)
+
+    mapped_keys = reference_keys.map(key_map)
+    unmatched_count = int(mapped_keys.isna().sum())
+    mapped_keys = mapped_keys.dropna()
+    return mapped_keys.value_counts(), unmatched_count
 
 
 @st.cache_resource
@@ -315,9 +375,32 @@ def render_credit_apps_page() -> None:
         st.warning("Unable to detect Unit Applied For column from reference data.")
         return
 
+    fuzzy_enabled = st.toggle("Use fuzzy matching (temporary)", value=True)
+    fuzzy_threshold = st.slider(
+        "Fuzzy match threshold",
+        min_value=0.70,
+        max_value=0.98,
+        value=0.86,
+        step=0.01,
+        disabled=not fuzzy_enabled,
+        help="Higher = stricter matching. Lower = more permissive matching.",
+    )
+
     reference_keys = reference_df[unit_applied_column].fillna("").astype(str).map(_normalize_unit_text)
     reference_keys = reference_keys[reference_keys != ""]
-    app_count_by_unit_key = reference_keys.value_counts()
+
+    if fuzzy_enabled:
+        summary_keys = summary_df["unit_key"].tolist()
+        app_count_by_unit_key, unmatched_reference_rows = _build_app_counts_fuzzy(
+            reference_keys, summary_keys, fuzzy_threshold
+        )
+        st.caption(
+            f"Fuzzy matching enabled (threshold {fuzzy_threshold:.2f}). "
+            f"Unmatched credit-app rows: {unmatched_reference_rows}"
+        )
+    else:
+        app_count_by_unit_key, unmatched_reference_rows = _build_app_counts_exact(reference_keys)
+        st.caption("Exact matching enabled.")
 
     all_units_df = summary_df.copy()
     all_units_df["number_of_credit_apps"] = all_units_df["unit_key"].map(app_count_by_unit_key).fillna(0).astype(int)
