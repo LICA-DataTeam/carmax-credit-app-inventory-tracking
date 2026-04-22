@@ -16,6 +16,11 @@ def _normalize_unit_text(value: str) -> str:
     return re.sub(r"\s+", " ", cleaned)
 
 
+def _normalize_plate_text(value: str) -> str:
+    # Normalize plate text so minor format differences (spaces/hyphens/case) still map together.
+    return re.sub(r"[^a-z0-9]+", "", value.lower()).strip()
+
+
 def _token_jaccard(a: str, b: str) -> float:
     a_tokens = set(a.split())
     b_tokens = set(b.split())
@@ -133,19 +138,24 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
             columns=[
                 "unit_base",
                 "unit",
+                "plate_number",
                 "model",
                 "acquisition_cost",
                 "target_selling_price",
                 "aging",
                 "unit_key",
+                "plate_key",
             ]
         )
 
     rows = values[1:]
     prepared_rows: list[dict] = []
+    plate_col_index = 7  # H: plate number in SUMMARY / OTHER_COL_INDEXES
     for row in rows:
         unit_base = " ".join([part for part in [_safe_cell(row, idx) for idx in st.secrets["UNIT_COL_INDEXES"]] if part])
         unit_key = _normalize_unit_text(unit_base)
+        plate_number = _safe_cell(row, plate_col_index)
+        plate_key = _normalize_plate_text(plate_number)
 
         if not unit_key:
             continue
@@ -154,11 +164,13 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
             {
                 "unit_base": unit_base,
                 "unit": unit_base,
+                "plate_number": plate_number,
                 "model": _safe_cell(row, st.secrets["SUMMARY_MODEL_COL_INDEX"]),
                 "acquisition_cost": _safe_cell(row, st.secrets["SUMMARY_ACQUISITION_COL_INDEX"]),
                 "target_selling_price": _safe_cell(row, st.secrets["SUMMARY_TARGET_COL_INDEX"]),
                 "aging": _safe_cell(row, st.secrets["SUMMARY_AGING_COL_INDEX"]),
                 "unit_key": unit_key,
+                "plate_key": plate_key,
             }
         )
 
@@ -166,7 +178,8 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    return df.drop_duplicates(subset=["unit_key"], keep="first").reset_index(drop=True)
+    # Keep distinct inventory entries by unit + plate number.
+    return df.drop_duplicates(subset=["unit_key", "plate_key"], keep="first").reset_index(drop=True)
 
 def _find_reference_unit_applied_column(reference_df: pd.DataFrame) -> str:
     if reference_df.empty:
@@ -282,11 +295,12 @@ def render_page() -> None:
     all_units_df = summary_df.copy()
     all_units_df["number_of_credit_apps"] = all_units_df["unit_key"].map(app_count_by_unit_key).fillna(0).astype(int)
 
-    metric_gt_3 = int((all_units_df["number_of_credit_apps"] > 3).sum())
-    metric_eq_2 = int((all_units_df["number_of_credit_apps"] == 2).sum())
-    metric_eq_1 = int((all_units_df["number_of_credit_apps"] == 1).sum())
-    metric_eq_0 = int((all_units_df["number_of_credit_apps"] == 0).sum())
-    total_units = len(all_units_df)
+    unit_level_df = all_units_df.drop_duplicates(subset=["unit_key"], keep="first")
+    metric_gt_3 = int((unit_level_df["number_of_credit_apps"] > 3).sum())
+    metric_eq_2 = int((unit_level_df["number_of_credit_apps"] == 2).sum())
+    metric_eq_1 = int((unit_level_df["number_of_credit_apps"] == 1).sum())
+    metric_eq_0 = int((unit_level_df["number_of_credit_apps"] == 0).sum())
+    total_units = len(unit_level_df)
     _render_distribution_cards(
         total_units=total_units,
         card_items=[
@@ -322,22 +336,26 @@ def render_page() -> None:
         st.info("No matching units found between masterlist and credit applications.")
         return
 
-    matched_df = matched_df.sort_values(by=["number_of_credit_apps", "unit"], ascending=[False, True]).reset_index(drop=True)
+    matched_df = matched_df.sort_values(
+        by=["number_of_credit_apps", "unit", "plate_number"], ascending=[False, True, True]
+    ).reset_index(drop=True)
 
     output_df = matched_df.rename(
         columns={
             "unit": "unit",
+            "plate_number": "plate number",
             "model": "model",
             "acquisition_cost": "acquisition cost",
             "target_selling_price": "target selling price",
             "aging": "aging",
             "number_of_credit_apps": "number of credit apps",
         }
-    )[["unit", "model", "acquisition cost", "target selling price", "aging", "number of credit apps"]]
+    )[["unit", "plate number", "model", "acquisition cost", "target selling price", "aging", "number of credit apps"]]
+    unique_matched_units = matched_df.drop_duplicates(subset=["unit_key"], keep="first")
 
     c5, c6 = st.columns(2)
-    c5.metric("Units with credit apps", len(output_df))
-    c6.metric("Total credit applications", int(output_df["number of credit apps"].sum()))
+    c5.metric("Inventory rows with credit apps", len(output_df))
+    c6.metric("Total credit applications", int(unique_matched_units["number_of_credit_apps"].sum()))
 
     st.dataframe(output_df, use_container_width=True)
     st.download_button(
