@@ -3,28 +3,7 @@ import gspread
 import difflib
 import pandas as pd
 import streamlit as st
-
-def _normalize_spreadsheet_id(value: str) -> str:
-    if "/spreadsheets/d/" in value:
-        return value.split("/spreadsheets/d/")[1].split("/")[0]
-    return value.strip()
-
-def _load_service_account_info() -> dict:
-    def _normalize_service_account_info(info: dict) -> dict:
-        normalized = dict(info)
-        private_key = normalized.get("private_key")
-        if isinstance(private_key, str):
-            # Streamlit secrets may contain literal "\n"; convert to real newlines.
-            normalized["private_key"] = private_key.replace("\\n", "\n")
-        return normalized
-
-    if "gcp_service_account" in st.secrets:
-        return _normalize_service_account_info(dict(st.secrets["gcp_service_account"]))
-
-    raise RuntimeError(
-        "Missing Google credentials. Add [gcp_service_account] to Streamlit secrets "
-        "or set GOOGLE_SERVICE_ACCOUNT_JSON."
-    )
+from shared import normalize_spreadsheet_id, load_service_account_info
 
 def _safe_cell(row: list[str], index: int) -> str:
     if index < len(row):
@@ -98,7 +77,7 @@ def _build_app_counts_fuzzy(
 
 @st.cache_resource
 def _get_gspread_client() -> gspread.Client:
-    service_account_info = _load_service_account_info()
+    service_account_info = load_service_account_info()
     return gspread.service_account_from_dict(service_account_info)
 
 @st.cache_data(ttl=300)
@@ -256,7 +235,7 @@ def render_page() -> None:
         st.error("Missing spreadsheet ID.")
         return
 
-    summary_spreadsheet_id = _normalize_spreadsheet_id(summary_spread_sheet_source)
+    summary_spreadsheet_id = normalize_spreadsheet_id(summary_spread_sheet_source)
 
     try:
         summary_df = load_summary_credit_view(summary_spreadsheet_id)
