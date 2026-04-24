@@ -4,6 +4,7 @@ st.set_page_config(page_title="Credit App Inventory Tracking", page_icon=":mater
 
 inv_tracking = st.Page("pages/1_Inventory_Tracking.py", title="Inventory Tracking", icon=":material/monitoring:")
 cred_appli_status = st.Page("pages/2_Credit_Application_Status.py", title="CA Status", icon=":material/done_all:")
+unit_inquiries = st.Page("pages/3_Unit_Inquiries.py", title="Unit Inquiries", icon=":material/ads_click:")
 
-pg = st.navigation([inv_tracking, cred_appli_status])
+pg = st.navigation([inv_tracking, cred_appli_status, unit_inquiries])
 pg.run()
