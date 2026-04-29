@@ -238,23 +238,47 @@ def render() -> None:
 
     teams = ["All", "Team George", "Team Jap", "Unassigned"]
     months = ["All"] + sorted([month for month in df["Month"].unique() if month], reverse=True)
-    statuses = ["All", "Approved", "Declined"]
+    statuses = ["All", "Approved", "Declined", "Pending"]
 
-    c1, c2, c3, c4 = st.columns(4)
-    selected_team = c1.selectbox("Team", teams, index=0)
-    selected_month = c2.selectbox("Month Selection", months, index=0)
-    selected_status = c3.selectbox("Approved/Declined", statuses, index=0)
+    st.subheader("Filters")
+    f1, f2, f3, f4 = st.columns([1.1, 1.1, 1.1, 1.2])
+    selected_team = f1.selectbox("Team", teams, index=0)
+    selected_month = f2.selectbox("Month Selection", months, index=0)
+    selected_status = f3.selectbox("Approved/Declined", statuses, index=0)
 
     team_filtered_df = df.copy()
     if selected_team != "All":
         team_filtered_df = team_filtered_df[team_filtered_df["Team"] == selected_team]
 
     agent_options = ["All"] + sorted(team_filtered_df["Agent Assigned"].dropna().unique().tolist())
-    selected_agent = c4.selectbox("Agent Assigned", agent_options, index=0)
+    selected_agent = f4.selectbox("Agent Assigned", agent_options, index=0)
+
+    if selected_month != "All":
+        day_source_df = team_filtered_df[team_filtered_df["Month"] == selected_month].copy()
+    else:
+        day_source_df = team_filtered_df.copy()
+
+    d1, d2, d3 = st.columns([0.8, 1.1, 2.1])
+    selected_day_enabled = d1.toggle("Daily View", value=False)
+
+    selected_day = None
+    day_values = pd.to_datetime(day_source_df["Date"], errors="coerce").dt.date.dropna()
+    if selected_day_enabled and not day_values.empty:
+        min_day = min(day_values)
+        max_day = max(day_values)
+        selected_day = d2.date_input("Select Date", value=max_day, min_value=min_day, max_value=max_day)
+        d3.caption(f"Showing daily data for **{selected_day.strftime('%Y-%m-%d')}**.")
+    elif selected_day_enabled and day_values.empty:
+        d2.info("No dates available")
+        d3.caption("No records available for the current Team/Month selection.")
+    else:
+        d3.caption("Daily filter is off. Showing all dates for the selected filters.")
 
     filtered_df = team_filtered_df.copy()
     if selected_month != "All":
         filtered_df = filtered_df[filtered_df["Month"] == selected_month]
+    if selected_day_enabled and selected_day is not None:
+        filtered_df = filtered_df[filtered_df["Date"] == selected_day.strftime("%Y-%m-%d")]
     if selected_status != "All":
         filtered_df = filtered_df[filtered_df["Approved/Declined"] == selected_status]
     if selected_agent != "All":

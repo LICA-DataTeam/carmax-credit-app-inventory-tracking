@@ -5,6 +5,9 @@ import pandas as pd
 import streamlit as st
 from shared import normalize_spreadsheet_id, load_service_account_info
 
+STATUS_COL_INDEX = 28  # AC
+
+
 def _safe_cell(row: list[str], index: int) -> str:
     if index < len(row):
         return row[index].strip()
@@ -19,6 +22,10 @@ def _normalize_unit_text(value: str) -> str:
 def _normalize_plate_text(value: str) -> str:
     # Normalize plate text so minor format differences (spaces/hyphens/case) still map together.
     return re.sub(r"[^a-z0-9]+", "", value.lower()).strip()
+
+
+def _is_available_status(value: str) -> bool:
+    return value.strip().lower() == "available"
 
 
 def _token_jaccard(a: str, b: str) -> float:
@@ -103,6 +110,8 @@ def load_summary_dataframe(spreadsheet_id: str) -> pd.DataFrame:
     selected_rows = []
 
     for row in rows:
+        if not _is_available_status(_safe_cell(row, STATUS_COL_INDEX)):
+            continue
         unit_parts = [_safe_cell(row, i) for i in st.secrets["UNIT_COL_INDEXES"] if _safe_cell(row, i)]
         unit_value = " ".join(unit_parts)
         other_values = [_safe_cell(row, i) for i in st.secrets["OTHER_COL_INDEXES"]]
@@ -152,6 +161,9 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
     prepared_rows: list[dict] = []
     plate_col_index = 7  # H: plate number in SUMMARY / OTHER_COL_INDEXES
     for row in rows:
+        if not _is_available_status(_safe_cell(row, STATUS_COL_INDEX)):
+            continue
+
         unit_base = " ".join([part for part in [_safe_cell(row, idx) for idx in st.secrets["UNIT_COL_INDEXES"]] if part])
         unit_key = _normalize_unit_text(unit_base)
         plate_number = _safe_cell(row, plate_col_index)

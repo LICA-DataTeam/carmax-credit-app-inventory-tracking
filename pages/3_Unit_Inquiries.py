@@ -1,19 +1,79 @@
 from calendar import monthrange
 from datetime import date
-
+import difflib
 import pandas as pd
 import streamlit as st
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
 from google.oauth2 import service_account
 
-from shared import load_service_account_info
+import re
+import gspread
+
+from shared import load_service_account_info, normalize_spreadsheet_id
 
 BQ_VIEW = st.secrets["BQ_VIEW"]
+STATUS_COL_INDEX = 28  # AC
 
 
 def _month_label(value: date) -> str:
     return value.strftime("%b %Y")
+
+
+def _safe_cell(row: list[str], index: int) -> str:
+    if index < len(row):
+        return row[index].strip()
+    return ""
+
+
+def _normalize_unit_text(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def _is_available_status(value: str) -> bool:
+    return value.strip().lower() == "available"
+
+
+def _token_jaccard(a: str, b: str) -> float:
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+    return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
+
+
+def _extract_year_make(key: str) -> tuple[str, str]:
+    tokens = key.split()
+    year = tokens[0] if tokens and re.fullmatch(r"\d{4}", tokens[0]) else ""
+    make = tokens[1] if len(tokens) > 1 else ""
+    return year, make
+
+
+def _fuzzy_match_unit_key(source_key: str, candidate_keys: list[str], threshold: float) -> str | None:
+    if source_key in candidate_keys:
+        return source_key
+
+    source_year, source_make = _extract_year_make(source_key)
+    narrowed = candidate_keys
+    if source_year:
+        narrowed = [k for k in narrowed if _extract_year_make(k)[0] == source_year] or narrowed
+    if source_make:
+        narrowed = [k for k in narrowed if _extract_year_make(k)[1] == source_make] or narrowed
+
+    best_key = None
+    best_score = -1.0
+    for candidate in narrowed:
+        seq = difflib.SequenceMatcher(None, source_key, candidate).ratio()
+        jac = _token_jaccard(source_key, candidate)
+        score = 0.7 * seq + 0.3 * jac
+        if score > best_score:
+            best_key = candidate
+            best_score = score
+
+    if best_key is None:
+        return None
+    return best_key if best_score >= threshold else None
 
 
 def _candidate_locations() -> list[str]:
@@ -37,6 +97,98 @@ def _get_bigquery_client() -> bigquery.Client:
     )
     project_id = service_account_info.get("project_id", "carmax-ph")
     return bigquery.Client(project=project_id, credentials=credentials)
+
+
+@st.cache_resource
+def _get_gspread_client() -> gspread.Client:
+    service_account_info = load_service_account_info()
+    return gspread.service_account_from_dict(service_account_info)
+
+
+@st.cache_data(ttl=600)
+def load_masterlist_unit_status_map() -> dict[str, str]:
+    source = st.secrets["GOOGLE_SHEETS_SPREADSHEET_ID"]
+    spreadsheet_id = normalize_spreadsheet_id(source)
+
+    client = _get_gspread_client()
+    workbook = client.open_by_key(spreadsheet_id)
+    worksheet = workbook.worksheet(st.secrets["SHEET_NAME"])
+    values = worksheet.get_all_values()
+
+    if len(values) <= 1:
+        return {}
+
+    rows = values[1:]
+    status_map: dict[str, str] = {}
+    for row in rows:
+        unit_parts = [_safe_cell(row, idx) for idx in st.secrets["UNIT_COL_INDEXES"] if _safe_cell(row, idx)]
+        unit_value = " ".join(unit_parts)
+        unit_key = _normalize_unit_text(unit_value)
+        if not unit_key:
+            continue
+
+        status_value = _safe_cell(row, STATUS_COL_INDEX) or "Unknown"
+        # Keep first seen status for stable mapping when duplicates exist.
+        if unit_key not in status_map:
+            status_map[unit_key] = status_value
+    return status_map
+
+
+@st.cache_data(ttl=600)
+def load_credit_application_counts_map() -> dict[str, int]:
+    summary_source = st.secrets["GOOGLE_SHEETS_SPREADSHEET_ID"]
+    summary_spreadsheet_id = normalize_spreadsheet_id(summary_source)
+    reference_spreadsheet_id = normalize_spreadsheet_id(st.secrets["SECOND_SHEET_SPREADSHEET_ID"])
+
+    client = _get_gspread_client()
+
+    summary_workbook = client.open_by_key(summary_spreadsheet_id)
+    summary_sheet = summary_workbook.worksheet(st.secrets["SHEET_NAME"])
+    summary_values = summary_sheet.get_all_values()
+    if len(summary_values) <= 1:
+        return {}
+
+    summary_rows = summary_values[1:]
+    summary_keys: list[str] = []
+    for row in summary_rows:
+        if not _is_available_status(_safe_cell(row, STATUS_COL_INDEX)):
+            continue
+        unit_parts = [_safe_cell(row, idx) for idx in st.secrets["UNIT_COL_INDEXES"] if _safe_cell(row, idx)]
+        unit_value = " ".join(unit_parts)
+        unit_key = _normalize_unit_text(unit_value)
+        if unit_key:
+            summary_keys.append(unit_key)
+
+    summary_keys = list(dict.fromkeys(summary_keys))
+    if not summary_keys:
+        return {}
+
+    ref_workbook = client.open_by_key(reference_spreadsheet_id)
+    ref_sheet = ref_workbook.get_worksheet(0)
+    ref_values = ref_sheet.get_all_values()
+    if len(ref_values) <= 1:
+        return {}
+
+    ref_rows = ref_values[1:]
+    unit_applied_idx = int(st.secrets["REFERENCE_UNIT_APPLIED_COL_INDEX"])
+    reference_keys = [
+        _normalize_unit_text(_safe_cell(row, unit_applied_idx))
+        for row in ref_rows
+        if _safe_cell(row, unit_applied_idx)
+    ]
+    reference_keys = [key for key in reference_keys if key]
+    if not reference_keys:
+        return {}
+
+    fuzzy_threshold = float(st.secrets.get("FUZZY_MATCH_THRESHOLD", 0.85))
+    counts: dict[str, int] = {}
+    for key in reference_keys:
+        matched_key = _fuzzy_match_unit_key(key, summary_keys, fuzzy_threshold)
+        if not matched_key:
+            continue
+        counts[matched_key] = counts.get(matched_key, 0) + 1
+
+    return counts
 
 
 def _query_result(
@@ -141,6 +293,8 @@ def render_page() -> None:
 
     try:
         month_options, make_model_df = load_filter_dimensions()
+        unit_status_map = load_masterlist_unit_status_map()
+        unit_credit_app_counts = load_credit_application_counts_map()
     except Exception as exc:
         st.error(f"Failed to load filters from BigQuery view: {exc}")
         st.stop()
@@ -153,7 +307,10 @@ def render_page() -> None:
     default_start_index = max(0, len(month_options) - 3)
     default_end_index = len(month_options) - 1
 
-    c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.2, 1.5, 0.8])
+    status_options = sorted(set(unit_status_map.values())) if unit_status_map else ["Unknown"]
+    status_filter_options = ["All"] + status_options
+
+    c1, c2, c3, c4, c5, c6, c7 = st.columns([1.1, 1.1, 1.2, 1.5, 0.8, 1.0, 1.3])
     selected_start_month = c1.selectbox(
         "Start Month",
         month_options,
@@ -178,6 +335,12 @@ def render_page() -> None:
     selected_models = c4.multiselect("Model", model_options, default=[])
 
     top_n = int(c5.number_input("Top N", min_value=1, max_value=500, value=30, step=1))
+    selected_status = c6.selectbox("Status", status_filter_options, index=0)
+    selected_ca_filter = c7.selectbox(
+        "Credit Applications",
+        ["All", "With Credit Applications", "Without Credit Applications"],
+        index=0,
+    )
 
     if selected_start_month > selected_end_month:
         st.error("Start Month cannot be later than End Month.")
@@ -197,6 +360,22 @@ def render_page() -> None:
     except Exception as exc:
         st.error(f"Failed to query inquiry data from BigQuery view: {exc}")
         st.stop()
+
+    if inquiry_df.empty:
+        st.info("No inquiry results for the selected filters.")
+        return
+
+    inquiry_df["unit_key"] = inquiry_df["unit_full"].fillna("").map(_normalize_unit_text)
+    inquiry_df["status"] = inquiry_df["unit_key"].map(unit_status_map).fillna("Unknown")
+    inquiry_df["credit_applications"] = (
+        inquiry_df["unit_key"].map(unit_credit_app_counts).fillna(0).astype(int)
+    )
+    if selected_status != "All":
+        inquiry_df = inquiry_df[inquiry_df["status"] == selected_status].copy()
+    if selected_ca_filter == "With Credit Applications":
+        inquiry_df = inquiry_df[inquiry_df["credit_applications"] > 0].copy()
+    elif selected_ca_filter == "Without Credit Applications":
+        inquiry_df = inquiry_df[inquiry_df["credit_applications"] == 0].copy()
 
     if inquiry_df.empty:
         st.info("No inquiry results for the selected filters.")
@@ -224,6 +403,8 @@ def render_page() -> None:
             "client_initiated_mentions": "client_initiated_mentions",
             "agent_initiated_mentions": "agent_initiated_mentions",
             "total_mentions": "total_mentions",
+            "status": "status",
+            "credit_applications": "credit_applications",
         }
     )[
         [
@@ -232,6 +413,8 @@ def render_page() -> None:
             "make",
             "model",
             "year",
+            "status",
+            "credit_applications",
             "client_initiated_mentions",
             "agent_initiated_mentions",
             "total_mentions",
@@ -246,6 +429,7 @@ def render_page() -> None:
         display_df,
         use_container_width=True,
         column_config={
+            "credit_applications": st.column_config.NumberColumn("Credit Applications"),
             "client_initiated_mentions": st.column_config.NumberColumn("Client-Initiated Mentions"),
             "agent_initiated_mentions": st.column_config.NumberColumn("Agent-Initiated Mentions"),
             "total_mentions": st.column_config.NumberColumn("Total Mentions"),
