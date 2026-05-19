@@ -307,7 +307,7 @@ def render_page() -> None:
     )
 
     plate_label = plate_number_column if plate_number_column else "none detected"
-    st.title("CarMax Inventory Tracking (Temp)")
+    st.title("CarMax Inventory Tracking")
     st.caption(
         "Revised view focused on lead coverage targets: each available unit should have at least 2 hot leads and no unit should remain at 0."
     )
