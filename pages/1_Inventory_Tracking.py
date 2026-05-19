@@ -1,11 +1,14 @@
 import re
+from collections import Counter
+
 import gspread
-import difflib
 import pandas as pd
 import streamlit as st
-from shared import normalize_spreadsheet_id, load_service_account_info
+
+from shared import load_service_account_info, normalize_spreadsheet_id
 
 STATUS_COL_INDEX = 28  # AC
+PLATE_COL_INDEX = 7  # H
 
 
 def _safe_cell(row: list[str], index: int) -> str:
@@ -20,71 +23,15 @@ def _normalize_unit_text(value: str) -> str:
 
 
 def _normalize_plate_text(value: str) -> str:
-    # Normalize plate text so minor format differences (spaces/hyphens/case) still map together.
     return re.sub(r"[^a-z0-9]+", "", value.lower()).strip()
+
+
+def _normalize_header_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
 def _is_available_status(value: str) -> bool:
     return value.strip().lower() == "available"
-
-
-def _token_jaccard(a: str, b: str) -> float:
-    a_tokens = set(a.split())
-    b_tokens = set(b.split())
-    if not a_tokens or not b_tokens:
-        return 0.0
-    return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
-
-
-def _extract_year_make(key: str) -> tuple[str, str]:
-    tokens = key.split()
-    year = tokens[0] if tokens and re.fullmatch(r"\d{4}", tokens[0]) else ""
-    make = tokens[1] if len(tokens) > 1 else ""
-    return year, make
-
-
-def _fuzzy_match_unit_key(source_key: str, candidate_keys: list[str], threshold: float) -> str | None:
-    if source_key in candidate_keys:
-        return source_key
-
-    source_year, source_make = _extract_year_make(source_key)
-    narrowed = candidate_keys
-    if source_year:
-        narrowed = [k for k in narrowed if _extract_year_make(k)[0] == source_year] or narrowed
-    if source_make:
-        narrowed = [k for k in narrowed if _extract_year_make(k)[1] == source_make] or narrowed
-
-    best_key = None
-    best_score = -1.0
-    for candidate in narrowed:
-        seq = difflib.SequenceMatcher(None, source_key, candidate).ratio()
-        jac = _token_jaccard(source_key, candidate)
-        score = 0.7 * seq + 0.3 * jac
-        if score > best_score:
-            best_key = candidate
-            best_score = score
-
-    if best_key is None:
-        return None
-    return best_key if best_score >= threshold else None
-
-
-def _build_app_counts_exact(reference_keys: pd.Series) -> tuple[pd.Series, int]:
-    counts = reference_keys.value_counts()
-    return counts, 0
-
-
-def _build_app_counts_fuzzy(
-    reference_keys: pd.Series, summary_keys: list[str], threshold: float
-) -> tuple[pd.Series, int]:
-    key_map: dict[str, str | None] = {}
-    for key in reference_keys.unique():
-        key_map[key] = _fuzzy_match_unit_key(key, summary_keys, threshold)
-
-    mapped_keys = reference_keys.map(key_map)
-    unmatched_count = int(mapped_keys.isna().sum())
-    mapped_keys = mapped_keys.dropna()
-    return mapped_keys.value_counts(), unmatched_count
 
 
 @st.cache_resource
@@ -92,35 +39,9 @@ def _get_gspread_client() -> gspread.Client:
     service_account_info = load_service_account_info()
     return gspread.service_account_from_dict(service_account_info)
 
-@st.cache_data(ttl=300)
-def load_summary_dataframe(spreadsheet_id: str) -> pd.DataFrame:
-    client = _get_gspread_client()
-    workbook = client.open_by_key(spreadsheet_id)
-    worksheet = workbook.worksheet(st.secrets["SHEET_NAME"])
-    values = worksheet.get_all_values()
-
-    if not values:
-        return pd.DataFrame()
-
-    header = values[0]
-    rows = values[1:]
-
-    other_headers = [header[i] if i < len(header) else f"COL_{i + 1}" for i in st.secrets["OTHER_COL_INDEXES"]]
-    selected_headers = ["unit"] + other_headers
-    selected_rows = []
-
-    for row in rows:
-        if not _is_available_status(_safe_cell(row, STATUS_COL_INDEX)):
-            continue
-        unit_parts = [_safe_cell(row, i) for i in st.secrets["UNIT_COL_INDEXES"] if _safe_cell(row, i)]
-        unit_value = " ".join(unit_parts)
-        other_values = [_safe_cell(row, i) for i in st.secrets["OTHER_COL_INDEXES"]]
-        selected_rows.append([unit_value] + other_values)
-
-    return pd.DataFrame(selected_rows, columns=selected_headers)
 
 @st.cache_data(ttl=300)
-def load_selected_columns_from_first_sheet(spreadsheet_id: str, column_indexes: list[int]) -> pd.DataFrame:
+def load_first_sheet_dataframe(spreadsheet_id: str) -> pd.DataFrame:
     client = _get_gspread_client()
     workbook = client.open_by_key(spreadsheet_id)
     worksheet = workbook.get_worksheet(0)
@@ -129,11 +50,11 @@ def load_selected_columns_from_first_sheet(spreadsheet_id: str, column_indexes: 
     if not values:
         return pd.DataFrame()
 
-    header = values[0]
+    headers = [header if header else f"COL_{i + 1}" for i, header in enumerate(values[0])]
     rows = values[1:]
-    selected_headers = [header[i] if i < len(header) else f"COL_{i + 1}" for i in column_indexes]
-    selected_rows = [[_safe_cell(row, i) for i in column_indexes] for row in rows]
-    return pd.DataFrame(selected_rows, columns=selected_headers)
+    selected_rows = [[_safe_cell(row, i) for i in range(len(headers))] for row in rows]
+    return pd.DataFrame(selected_rows, columns=headers)
+
 
 @st.cache_data(ttl=300)
 def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
@@ -145,7 +66,6 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
     if len(values) <= 1:
         return pd.DataFrame(
             columns=[
-                "unit_base",
                 "unit",
                 "plate_number",
                 "model",
@@ -159,23 +79,22 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
 
     rows = values[1:]
     prepared_rows: list[dict] = []
-    plate_col_index = 7  # H: plate number in SUMMARY / OTHER_COL_INDEXES
     for row in rows:
         if not _is_available_status(_safe_cell(row, STATUS_COL_INDEX)):
             continue
 
-        unit_base = " ".join([part for part in [_safe_cell(row, idx) for idx in st.secrets["UNIT_COL_INDEXES"]] if part])
-        unit_key = _normalize_unit_text(unit_base)
-        plate_number = _safe_cell(row, plate_col_index)
-        plate_key = _normalize_plate_text(plate_number)
-
+        unit_parts = [_safe_cell(row, idx) for idx in st.secrets["UNIT_COL_INDEXES"] if _safe_cell(row, idx)]
+        unit_value = " ".join(unit_parts)
+        unit_key = _normalize_unit_text(unit_value)
         if not unit_key:
             continue
 
+        plate_number = _safe_cell(row, PLATE_COL_INDEX)
+        plate_key = _normalize_plate_text(plate_number)
+
         prepared_rows.append(
             {
-                "unit_base": unit_base,
-                "unit": unit_base,
+                "unit": unit_value,
                 "plate_number": plate_number,
                 "model": _safe_cell(row, st.secrets["SUMMARY_MODEL_COL_INDEX"]),
                 "acquisition_cost": _safe_cell(row, st.secrets["SUMMARY_ACQUISITION_COL_INDEX"]),
@@ -189,9 +108,8 @@ def load_summary_credit_view(spreadsheet_id: str) -> pd.DataFrame:
     df = pd.DataFrame(prepared_rows)
     if df.empty:
         return df
-
-    # Keep distinct inventory entries by unit + plate number.
     return df.drop_duplicates(subset=["unit_key", "plate_key"], keep="first").reset_index(drop=True)
+
 
 def _find_reference_unit_applied_column(reference_df: pd.DataFrame) -> str:
     if reference_df.empty:
@@ -206,67 +124,169 @@ def _find_reference_unit_applied_column(reference_df: pd.DataFrame) -> str:
         return reference_df.columns[2]
     return reference_df.columns[0]
 
-def _render_distribution_cards(total_units: int, card_items: list[dict]) -> None:
+
+def _find_reference_plate_column(reference_df: pd.DataFrame) -> str:
+    if reference_df.empty:
+        return ""
+
+    for column_name in reference_df.columns:
+        normalized = _normalize_header_text(column_name)
+        if normalized == "unit plate number":
+            return column_name
+
+    for column_name in reference_df.columns:
+        normalized = _normalize_header_text(column_name)
+        if "plate number" in normalized:
+            return column_name
+
+    return ""
+
+
+def _build_app_counts_hybrid_exact(
+    reference_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    unit_column: str,
+    plate_column: str,
+) -> tuple[pd.Series, dict[str, int]]:
+    summary_keys = summary_df["unit_key"].dropna().tolist()
+    summary_key_set = set(summary_keys)
+    plate_to_unit_key: dict[str, str] = {}
+    for row in summary_df.itertuples(index=False):
+        plate_key = getattr(row, "plate_key", "")
+        if plate_key and plate_key not in plate_to_unit_key:
+            plate_to_unit_key[plate_key] = getattr(row, "unit_key")
+
+    app_counts: Counter[str] = Counter()
+    qa_stats = {
+        "total_apps": 0,
+        "matched_by_plate": 0,
+        "matched_by_unit_exact": 0,
+        "unmatched": 0,
+    }
+
+    for _, row in reference_df.iterrows():
+        raw_unit = str(row.get(unit_column, "") or "").strip()
+        raw_plate = str(row.get(plate_column, "") or "").strip() if plate_column else ""
+        unit_key = _normalize_unit_text(raw_unit)
+        plate_key = _normalize_plate_text(raw_plate)
+
+        if not unit_key and not plate_key:
+            continue
+
+        qa_stats["total_apps"] += 1
+        matched_unit_key = None
+
+        if plate_key:
+            matched_unit_key = plate_to_unit_key.get(plate_key)
+            if matched_unit_key:
+                qa_stats["matched_by_plate"] += 1
+
+        if not matched_unit_key and unit_key:
+            matched_unit_key = unit_key if unit_key in summary_key_set else None
+            if matched_unit_key:
+                qa_stats["matched_by_unit_exact"] += 1
+
+        if matched_unit_key:
+            app_counts[matched_unit_key] += 1
+        else:
+            qa_stats["unmatched"] += 1
+
+    return pd.Series(app_counts, dtype="int64"), qa_stats
+
+
+def _inject_page_styles() -> None:
     st.markdown(
         """
         <style>
-        .ca-dist-card {
-            border-radius: 14px;
-            padding: 14px 16px;
-            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.10);
-            min-height: 120px;
+        .metric-card {
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 12px;
+            padding: 12px 14px;
+            box-shadow: 0 3px 10px rgba(15, 23, 42, 0.08);
+            min-height: 110px;
+            margin-bottom: 0.6rem;
         }
-        .ca-dist-title {
-            font-size: 0.85rem;
-            font-weight: 600;
-            color: #1f2937;
-            margin-bottom: 8px;
+
+        .metric-card.info {
+            background: #dbeafe;
+            border-color: #93c5fd;
         }
-        .ca-dist-value {
-            font-size: 2rem;
+
+        .metric-card.good {
+            background: #dcfce7;
+            border-color: #86efac;
+        }
+
+        .metric-card.warn {
+            background: #fef3c7;
+            border-color: #fcd34d;
+        }
+
+        .metric-card.risk {
+            background: #fee2e2;
+            border-color: #fca5a5;
+        }
+
+        .metric-card-label {
+            font-weight: 700;
+            color: #0f172a;
+            font-size: 0.84rem;
+            margin-bottom: 0.35rem;
+        }
+
+        .metric-card-value {
             font-weight: 800;
             line-height: 1.1;
-            color: #111827;
-            margin-bottom: 4px;
+            color: #0f172a;
+            font-size: 2rem;
+            margin-bottom: 0.2rem;
         }
-        .ca-dist-sub {
-            font-size: 0.82rem;
-            color: #374151;
+
+        .metric-card-sub {
+            color: #334155;
+            font-size: 0.84rem;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    cols = st.columns(len(card_items))
-    for col, item in zip(cols, card_items):
-        count = int(item["count"])
-        pct = (count / total_units * 100) if total_units else 0.0
-        col.markdown(
-            f"""
-            <div class="ca-dist-card" style="background:{item['background']}; border:1px solid {item['border']};">
-                <div class="ca-dist-title">{item['title']}</div>
-                <div class="ca-dist-value">{count}</div>
-                <div class="ca-dist-sub">{pct:.1f}% of {total_units} units</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+
+def _render_stat_cards(items: list[dict], columns: int) -> None:
+    cols = st.columns(columns)
+    for i, item in enumerate(items):
+        tone = item.get("tone", "info")
+        label = item.get("label", "")
+        value = item.get("value", "")
+        sub = item.get("sub", "")
+        with cols[i % columns]:
+            st.markdown(
+                f"""
+                <div class="metric-card {tone}">
+                    <div class="metric-card-label">{label}</div>
+                    <div class="metric-card-value">{value}</div>
+                    <div class="metric-card-sub">{sub}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
 
 def render_page() -> None:
-    st.title("CarMax Inventory Tracking & Credit Application Tracker")
-    summary_spread_sheet_source = st.secrets["GOOGLE_SHEETS_SPREADSHEET_ID"]
-    if not summary_spread_sheet_source:
+    _inject_page_styles()
+
+    summary_source = st.secrets["GOOGLE_SHEETS_SPREADSHEET_ID"]
+    if not summary_source:
         st.error("Missing spreadsheet ID.")
         return
 
-    summary_spreadsheet_id = normalize_spreadsheet_id(summary_spread_sheet_source)
+    summary_spreadsheet_id = normalize_spreadsheet_id(summary_source)
 
     try:
         summary_df = load_summary_credit_view(summary_spreadsheet_id)
-        reference_df = load_selected_columns_from_first_sheet(st.secrets["SECOND_SHEET_SPREADSHEET_ID"], st.secrets["SECOND_SHEET_COL_INDEXES"])
-    except Exception as e:
-        st.error(f"Failed to load source data: {e}")
+        reference_df = load_first_sheet_dataframe(st.secrets["SECOND_SHEET_SPREADSHEET_ID"])
+    except Exception as exc:
+        st.error(f"Failed to load source data: {exc}")
         st.stop()
 
     if summary_df.empty:
@@ -275,111 +295,234 @@ def render_page() -> None:
 
     unit_applied_column = _find_reference_unit_applied_column(reference_df)
     if not unit_applied_column:
-        st.warning("Unable to dectec Unit Applied For column from reference data.")
+        st.warning("Unable to detect Unit Applied For column from reference data.")
         return
 
-    fuzzy_enabled = st.toggle("Use fuzzy matching (temporary)", value=True)
-    fuzzy_threshold = st.slider(
-        "Fuzzy match threshold",
-        min_value=0.70,
-        max_value=0.98,
-        value=0.85,
-        step=0.01,
-        disabled=not fuzzy_enabled,
-        help="Higher = stricter matching. Lower = more permissive matching."
+    plate_number_column = _find_reference_plate_column(reference_df)
+    app_count_by_unit_key, qa_stats = _build_app_counts_hybrid_exact(
+        reference_df=reference_df,
+        summary_df=summary_df,
+        unit_column=unit_applied_column,
+        plate_column=plate_number_column,
     )
 
-    reference_keys = reference_df[unit_applied_column].fillna("").astype(str).map(_normalize_unit_text)
-    reference_keys = reference_keys[reference_keys != ""]
-    if fuzzy_enabled:
-        summary_keys = summary_df["unit_key"].tolist()
-        app_count_by_unit_key, unmatched_reference_rows = _build_app_counts_fuzzy(
-            reference_keys, summary_keys, fuzzy_threshold
-        )
-        st.caption(
-            f"Fuzzy matching enabled (threshold {fuzzy_threshold:.2f}). "
-            f"Unmatched credit-app rows: {unmatched_reference_rows}"
-        )
-    else:
-        app_count_by_unit_key, unmatched_reference_rows = _build_app_counts_exact(reference_keys)
-        st.caption("Exact matching enabled.")
+    plate_label = plate_number_column if plate_number_column else "none detected"
+    st.title("CarMax Inventory Tracking (Temp)")
+    st.caption(
+        "Revised view focused on lead coverage targets: each available unit should have at least 2 hot leads and no unit should remain at 0."
+    )
+    st.caption(
+        f"Matching mode: plate-first + exact unit fallback | Unit column: {unit_applied_column} | Plate column: {plate_label}"
+    )
 
     all_units_df = summary_df.copy()
-    all_units_df["number_of_credit_apps"] = all_units_df["unit_key"].map(app_count_by_unit_key).fillna(0).astype(int)
+    all_units_df["hot_leads"] = all_units_df["unit_key"].map(app_count_by_unit_key).fillna(0).astype(int)
 
-    unit_level_df = all_units_df.drop_duplicates(subset=["unit_key"], keep="first")
-    metric_gt_3 = int((unit_level_df["number_of_credit_apps"] > 3).sum())
-    metric_eq_2 = int((unit_level_df["number_of_credit_apps"] == 2).sum())
-    metric_eq_1 = int((unit_level_df["number_of_credit_apps"] == 1).sum())
-    metric_eq_0 = int((unit_level_df["number_of_credit_apps"] == 0).sum())
+    unit_level_df = all_units_df.drop_duplicates(subset=["unit_key"], keep="first").copy()
     total_units = len(unit_level_df)
-    _render_distribution_cards(
-        total_units=total_units,
-        card_items=[
+    units_meeting_goal = int((unit_level_df["hot_leads"] >= 2).sum())
+    units_with_1 = int((unit_level_df["hot_leads"] == 1).sum())
+    units_with_0 = int((unit_level_df["hot_leads"] == 0).sum())
+    units_with_credit_apps = int((unit_level_df["hot_leads"] > 0).sum())
+    units_below_goal = int((unit_level_df["hot_leads"] < 2).sum())
+    goal_coverage_pct = (units_meeting_goal / total_units * 100.0) if total_units else 0.0
+    units_with_credit_apps_pct = (units_with_credit_apps / total_units * 100.0) if total_units else 0.0
+
+    show_match_quality = st.toggle(
+        "Show Match Quality (optional)",
+        value=False,
+        help="Show/hide data matching diagnostics. Keep hidden for management-focused view.",
+    )
+    if show_match_quality:
+        total_apps = int(qa_stats.get("total_apps", 0))
+        plate_pct = (qa_stats["matched_by_plate"] / total_apps * 100.0) if total_apps else 0.0
+        fallback_pct = (qa_stats["matched_by_unit_exact"] / total_apps * 100.0) if total_apps else 0.0
+        unmatched_pct = (qa_stats["unmatched"] / total_apps * 100.0) if total_apps else 0.0
+
+        st.markdown("### Match Quality")
+        _render_stat_cards(
+            [
+                {
+                    "label": "Matched by Plate",
+                    "value": qa_stats["matched_by_plate"],
+                    "sub": f"{plate_pct:.1f}% of {total_apps} applications",
+                    "tone": "good",
+                },
+                {
+                    "label": "Matched by Unit (Exact)",
+                    "value": qa_stats["matched_by_unit_exact"],
+                    "sub": f"{fallback_pct:.1f}% of {total_apps} applications",
+                    "tone": "warn",
+                },
+                {
+                    "label": "Unmatched Applications",
+                    "value": qa_stats["unmatched"],
+                    "sub": f"{unmatched_pct:.1f}% of {total_apps} applications",
+                    "tone": "risk",
+                },
+            ],
+            columns=3,
+        )
+
+    st.markdown("### Lead Coverage Overview")
+    _render_stat_cards(
+        [
             {
-                "title": "Units with >3 CAs",
-                "count": metric_gt_3,
-                "background": "linear-gradient(135deg, #fee2e2, #fecaca)",
-                "border": "#f87171",
+                "label": "Total Available Inventory Units",
+                "value": total_units,
+                "sub": "All units currently tagged as Available",
+                "tone": "info",
             },
             {
-                "title": "Units with 2 CAs",
-                "count": metric_eq_2,
-                "background": "linear-gradient(135deg, #ffedd5, #fed7aa)",
-                "border": "#fb923c",
+                "label": "Total Units with Credit Apps",
+                "value": units_with_credit_apps,
+                "sub": f"{units_with_credit_apps_pct:.1f}% of all available units",
+                "tone": "info",
             },
             {
-                "title": "Units with 1 CA",
-                "count": metric_eq_1,
-                "background": "linear-gradient(135deg, #dcfce7, #bbf7d0)",
-                "border": "#4ade80",
+                "label": "Units Meeting Goal",
+                "value": units_meeting_goal,
+                "sub": "At least 2 hot leads",
+                "tone": "good",
             },
             {
-                "title": "Units with 0 CAs",
-                "count": metric_eq_0,
-                "background": "linear-gradient(135deg, #e0f2fe, #bae6fd)",
-                "border": "#38bdf8",
+                "label": "Units Below Goal",
+                "value": units_below_goal,
+                "sub": "0 to 1 hot leads",
+                "tone": "warn",
+            },
+            {
+                "label": "Units with 0 Hot Leads",
+                "value": units_with_0,
+                "sub": "Priority follow-up list",
+                "tone": "risk",
+            },
+            {
+                "label": "Coverage Rate",
+                "value": f"{goal_coverage_pct:.1f}%",
+                "sub": "Units currently at >=2 hot leads",
+                "tone": "info",
             },
         ],
+        columns=3,
+    )
+    st.progress(goal_coverage_pct / 100.0, text=f"Coverage progress: {goal_coverage_pct:.1f}%")
+
+    if units_with_0 == 0:
+        st.success("Goal check: No inventory units are at 0 hot leads.")
+    else:
+        st.warning(f"Goal check: {units_with_0} units are still at 0 hot leads.")
+
+    st.caption("Hot leads are currently proxied by matched credit-application rows.")
+
+    st.markdown("### Lead Distribution")
+    _render_stat_cards(
+        [
+            {
+                "label": "Units with >3 Hot Leads",
+                "value": int((unit_level_df["hot_leads"] > 3).sum()),
+                "sub": "Strong demand signal",
+                "tone": "good",
+            },
+            {
+                "label": "Units with 2 Hot Leads",
+                "value": int((unit_level_df["hot_leads"] == 2).sum()),
+                "sub": "At goal threshold",
+                "tone": "info",
+            },
+            {
+                "label": "Units with 1 Hot Lead",
+                "value": units_with_1,
+                "sub": "Needs 1 more lead",
+                "tone": "warn",
+            },
+            {
+                "label": "Units with 0 Hot Leads",
+                "value": units_with_0,
+                "sub": "Critical gap",
+                "tone": "risk",
+            },
+        ],
+        columns=4,
     )
 
-    matched_df = all_units_df[all_units_df["number_of_credit_apps"] > 0].copy()
-    if matched_df.empty:
-        st.info("No matching units found between masterlist and credit applications.")
-        return
-
-    matched_df = matched_df.sort_values(
-        by=["number_of_credit_apps", "unit", "plate_number"], ascending=[False, True, True]
+    below_goal_df = all_units_df[all_units_df["hot_leads"] < 2].copy()
+    below_goal_df = below_goal_df.sort_values(
+        by=["hot_leads", "aging", "unit", "plate_number"], ascending=[True, False, True, True]
     ).reset_index(drop=True)
 
-    output_df = matched_df.rename(
+    all_units_output = all_units_df.sort_values(
+        by=["hot_leads", "unit", "plate_number"], ascending=[False, True, True]
+    ).rename(
         columns={
-            "unit": "unit",
             "plate_number": "plate number",
-            "model": "model",
             "acquisition_cost": "acquisition cost",
             "target_selling_price": "target selling price",
-            "aging": "aging",
-            "number_of_credit_apps": "number of credit apps",
         }
-    )[["unit", "plate number", "model", "acquisition cost", "target selling price", "aging", "number of credit apps"]]
-    unique_matched_units = matched_df.drop_duplicates(subset=["unit_key"], keep="first")
+    )[
+        [
+            "unit",
+            "plate number",
+            "model",
+            "acquisition cost",
+            "target selling price",
+            "aging",
+            "hot_leads",
+        ]
+    ]
 
-    c5, c6 = st.columns(2)
-    c5.metric("Inventory rows with credit apps", len(output_df))
-    c6.metric("Total credit applications", int(unique_matched_units["number_of_credit_apps"].sum()))
+    tab1, tab2 = st.tabs(["Action List (Below Goal)", "All Available Inventory"])
+    with tab1:
+        if below_goal_df.empty:
+            st.success("No units below goal. All inventory units have at least 2 hot leads.")
+        else:
+            st.markdown("#### Units Below Goal (0-1 hot leads)")
+            below_goal_output = below_goal_df.rename(
+                columns={
+                    "plate_number": "plate number",
+                    "acquisition_cost": "acquisition cost",
+                    "target_selling_price": "target selling price",
+                }
+            )[
+                [
+                    "unit",
+                    "plate number",
+                    "model",
+                    "acquisition cost",
+                    "target selling price",
+                    "aging",
+                    "hot_leads",
+                ]
+            ]
+            st.dataframe(
+                below_goal_output,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"hot_leads": st.column_config.NumberColumn("hot leads")},
+            )
 
-    st.dataframe(output_df, use_container_width=True)
+    with tab2:
+        st.dataframe(
+            all_units_output,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"hot_leads": st.column_config.NumberColumn("hot leads")},
+        )
+
     st.download_button(
-        "Download CSV",
-        output_df.to_csv(index=False).encode("utf-8"),
-        file_name="units_with_credit_apps.csv",
+        "Download CSV (All Units)",
+        all_units_output.to_csv(index=False).encode("utf-8"),
+        file_name="inventory_hot_leads_temp.csv",
         mime="text/csv",
     )
 
+
 def main() -> None:
-    st.set_page_config(page_title="Inventory Tracking", layout="wide")
+    st.set_page_config(page_title="Inventory Tracking Temp", layout="wide")
     render_page()
+
 
 if __name__ == "__main__":
     main()
+
+
