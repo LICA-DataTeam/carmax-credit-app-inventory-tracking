@@ -313,7 +313,7 @@ def render_page() -> None:
     if month_options:
         month_filter_options: list[str | pd.Timestamp] = ["All months"] + month_options
         selected_month = st.selectbox(
-            "Credit Application Month (from column A)",
+            "Month",
             month_filter_options,
             index=0,
             format_func=lambda value: value if isinstance(value, str) else value.strftime("%b %Y"),
