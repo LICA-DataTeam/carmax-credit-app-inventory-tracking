@@ -9,6 +9,7 @@ from shared import load_service_account_info, normalize_spreadsheet_id
 
 STATUS_COL_INDEX = 28  # AC
 PLATE_COL_INDEX = 7  # H
+REFERENCE_MONTH_COL_INDEX = 0  # A (first column) from SECOND_SHEET_SPREADSHEET_ID
 
 
 def _safe_cell(row: list[str], index: int) -> str:
@@ -140,6 +141,21 @@ def _find_reference_plate_column(reference_df: pd.DataFrame) -> str:
             return column_name
 
     return ""
+
+
+def _build_reference_month_series(reference_df: pd.DataFrame) -> tuple[pd.Series, list[pd.Timestamp], str]:
+    if reference_df.empty:
+        return pd.Series(dtype="datetime64[ns]"), [], ""
+
+    month_source_column = reference_df.columns[REFERENCE_MONTH_COL_INDEX]
+    raw_values = reference_df[month_source_column].fillna("").astype(str).str.strip()
+    # Credit form timestamps are in DD/MM/YYYY format, so parse day-first.
+    parsed_dates = pd.to_datetime(raw_values, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    parsed_dates = parsed_dates.fillna(pd.to_datetime(raw_values, format="%d/%m/%Y", errors="coerce"))
+    parsed_dates = parsed_dates.fillna(pd.to_datetime(raw_values, dayfirst=True, errors="coerce"))
+    month_series = parsed_dates.dt.to_period("M").dt.to_timestamp()
+    month_options = sorted(month_series.dropna().unique().tolist(), reverse=True)
+    return month_series, month_options, month_source_column
 
 
 def _build_app_counts_hybrid_exact(
@@ -293,6 +309,31 @@ def render_page() -> None:
         st.warning("No summary data available.")
         return
 
+    month_series, month_options, month_source_column = _build_reference_month_series(reference_df)
+    if month_options:
+        month_filter_options: list[str | pd.Timestamp] = ["All months"] + month_options
+        selected_month = st.selectbox(
+            "Credit Application Month (from column A)",
+            month_filter_options,
+            index=0,
+            format_func=lambda value: value if isinstance(value, str) else value.strftime("%b %Y"),
+        )
+        if isinstance(selected_month, pd.Timestamp):
+            reference_df_filtered = reference_df[month_series == selected_month].copy()
+        else:
+            reference_df_filtered = reference_df
+
+        st.caption(
+            f"Month source column: {month_source_column}. "
+            f"Rows used for matching: {len(reference_df_filtered)}"
+        )
+    else:
+        reference_df_filtered = reference_df
+        st.caption(
+            f"Month filter unavailable: unable to parse dates from column {month_source_column or 'A'}. "
+            f"Using all {len(reference_df_filtered)} credit application rows."
+        )
+
     unit_applied_column = _find_reference_unit_applied_column(reference_df)
     if not unit_applied_column:
         st.warning("Unable to detect Unit Applied For column from reference data.")
@@ -300,7 +341,7 @@ def render_page() -> None:
 
     plate_number_column = _find_reference_plate_column(reference_df)
     app_count_by_unit_key, qa_stats = _build_app_counts_hybrid_exact(
-        reference_df=reference_df,
+        reference_df=reference_df_filtered,
         summary_df=summary_df,
         unit_column=unit_applied_column,
         plate_column=plate_number_column,
