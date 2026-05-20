@@ -73,12 +73,12 @@ def _apply_table_controls(
     elif ca_bucket == "2+":
         filtered = filtered[filtered["ca_and_cash"] >= 2]
 
-    if aging_bucket == "New (<7)":
-        filtered = filtered[filtered["aging_days"] < 7]
+    if aging_bucket == "New (<=7)":
+        filtered = filtered[filtered["aging_days"] <= 7]
     elif aging_bucket == "Old (>7)":
         filtered = filtered[filtered["aging_days"] > 7]
-    elif aging_bucket == "Boundary (=7)":
-        filtered = filtered[filtered["aging_days"] == 7]
+    # elif aging_bucket == "Boundary (=7)":
+    #     filtered = filtered[filtered["aging_days"] == 7]
 
     return filtered
 
@@ -410,13 +410,23 @@ def render_page() -> None:
     row_level_df = all_units_df.copy()
     row_level_df["aging_days"] = row_level_df["aging"].map(_parse_aging_days)
     total_units = len(row_level_df)
-    new_units_df = row_level_df[row_level_df["aging_days"] < 7].copy()
+    new_units_df = row_level_df[row_level_df["aging_days"] <= 7].copy()
     old_units_df = row_level_df[row_level_df["aging_days"] > 7].copy()
-    boundary_units_df = row_level_df[row_level_df["aging_days"] == 7].copy()
+    # boundary_units_df = row_level_df[row_level_df["aging_days"] == 7].copy()
+    units_meeting_goal = int((row_level_df["ca_and_cash"] >= 2).sum())
+    goal_coverage_pct = (units_meeting_goal / total_units * 100.0) if total_units else 0.0
+    units_with_credit_apps = int((row_level_df["ca_and_cash"] > 0).sum())
+    units_with_credit_apps_pct = (units_with_credit_apps / total_units * 100.0) if total_units else 0.0
 
     total_new_units = int(len(new_units_df))
     total_old_units = int(len(old_units_df))
-    total_boundary_units = int(len(boundary_units_df))
+    # total_boundary_units = int(len(boundary_units_df))
+    new_units_with_0 = int((new_units_df["ca_and_cash"] == 0).sum())
+    new_units_with_1 = int((new_units_df["ca_and_cash"] == 1).sum())
+    new_units_with_2_plus = int((new_units_df["ca_and_cash"] >= 2).sum())
+    new_units_with_apps = int((new_units_df["ca_and_cash"] > 0).sum())
+    new_units_with_apps_pct = (new_units_with_apps / total_new_units * 100.0) if total_new_units else 0.0
+    old_units_with_0 = int((old_units_df["ca_and_cash"] == 0).sum())
     old_units_with_0 = int((old_units_df["ca_and_cash"] == 0).sum())
     old_units_with_1 = int((old_units_df["ca_and_cash"] == 1).sum())
     old_units_with_2_plus = int((old_units_df["ca_and_cash"] >= 2).sum())
@@ -459,84 +469,116 @@ def render_page() -> None:
             columns=3,
         )
 
-    st.markdown("### Lead Coverage Overview")
+    st.markdown("## Inventory Overview")
     _render_stat_cards(
         [
             {
                 "label": "Total Available Inventory Units",
                 "value": total_units,
                 "sub": "Unique available inventory units",
-                "tone": "info",
+                "tone": "info"
             },
             {
                 "label": "New Units",
                 "value": total_new_units,
-                "sub": "Aging < 7 days",
-                "tone": "info",
+                "sub": "Aging <= 7 days",
+                "tone": "info"
             },
             {
                 "label": "Old Units",
-                "value": total_old_units,
-                "sub": "Aging > 7 days",
-                "tone": "good",
-            },
-            {
-                "label": "Old Units with CA and Cash",
-                "value": old_units_with_apps,
-                "sub": f"{old_units_with_apps_pct:.1f}% of old units",
-                "tone": "warn",
-            },
-            {
-                "label": "Aging = 7 Days",
-                "value": total_boundary_units,
-                "sub": "Boundary bucket (excluded from old/new rule)",
-                "tone": "risk",
-            },
-            {
-                "label": "Old Units without CA and Cash",
-                "value": old_units_with_0,
-                "sub": "Old units with zero applications",
-                "tone": "info",
-            },
-        ],
-        columns=3,
-    )
-    if total_boundary_units > 0:
-        st.info(
-            f"{total_boundary_units} units have aging exactly 7 days and are not included in old/new buckets to avoid overlap."
-        )
-
-    st.caption("CA and Cash counts are currently proxied by matched credit-application rows.")
-
-    st.markdown("### Old Units Breakdown")
-    _render_stat_cards(
-        [
-            {
-                "label": "Old Units with 0 CA and Cash",
-                "value": old_units_with_0,
-                "sub": "Aging > 7 and no applications",
-                "tone": "warn",
-            },
-            {
-                "label": "Old Units with 1 CA and Cash",
-                "value": old_units_with_1,
-                "sub": "Aging > 7 and one application",
-                "tone": "info",
-            },
-            {
-                "label": "Old Units with 2+ CA and Cash",
-                "value": old_units_with_2_plus,
-                "sub": "Aging > 7 and at least two applications",
-                "tone": "good",
-            },
-            {
-                "label": "Check (Old Bucket Total)",
                 "value": old_units_with_0 + old_units_with_1 + old_units_with_2_plus,
                 "sub": f"Should equal old units: {total_old_units}",
                 "tone": "risk",
             },
         ],
-        columns=4,
+        columns=3
+    )
+
+    st.markdown("### CA Coverage Overview")
+    _render_stat_cards(
+        [
+            {
+                "label": "Units with Credit Apps",
+                "value": units_with_credit_apps,
+                "sub": f"{units_with_credit_apps_pct:.1f}% of all available units",
+                "tone": "info"
+            },
+            {
+                "label": "Coverage Rate",
+                "value": f"{goal_coverage_pct:.1f}%",
+                "sub": "Units currently at >= 2 CAs",
+                "tone": "info"
+            },
+            {
+                "label": "Old Units with CA",
+                "value": old_units_with_apps,
+                "sub": f"{old_units_with_apps_pct:.1f}% of old units",
+                "tone": "warn"
+            },
+            {
+                "label": "New Units with CA",
+                "value": new_units_with_apps,
+                "sub": f"{new_units_with_apps_pct:.1f}% of new units",
+                "tone": "warn"
+            }
+        ],
+        columns=2,
+    )
+    # if total_boundary_units > 0:
+    #     st.info(
+    #         f"{total_boundary_units} units have aging exactly 7 days and are not included in old/new buckets to avoid overlap."
+    #     )
+
+    st.caption("CA and Cash counts are currently proxied by matched credit-application rows.")
+
+    st.markdown("### New Units Breakdown")
+    _render_stat_cards(
+        [
+            {
+                "label": "New Units with 0 CA",
+                "value": new_units_with_0,
+                "sub": "Aging <= 7 and no applications",
+                "tone": "warn"
+            },
+            {
+                "label": "New Units with 1 CA",
+                "value": new_units_with_1,
+                "sub": "Aging <=7 and one application",
+                "tone": "warn"
+            },
+            {
+                "label": "New Units with 2+ CA",
+                "value": new_units_with_2_plus,
+                "sub": "Aging <= 7 and at least two applications",
+                "tone": "good"
+            }
+        ],
+        columns=3
+    )
+
+    st.markdown("### Old Units Breakdown")
+    _render_stat_cards(
+        [
+            {
+                "label": "Old Units with 0 CA",
+                "value": old_units_with_0,
+                "sub": "Aging > 7 and no applications",
+                "tone": "warn",
+            },
+            {
+                "label": "Old Units with 1 CA",
+                "value": old_units_with_1,
+                "sub": "Aging > 7 and one application",
+                "tone": "info",
+            },
+            {
+                "label": "Old Units with 2+ CA",
+                "value": old_units_with_2_plus,
+                "sub": "Aging > 7 and at least two applications",
+                "tone": "good",
+            },
+        ],
+        columns=3,
     )
 
     all_units_df["aging_days"] = all_units_df["aging"].map(_parse_aging_days)
@@ -552,7 +594,7 @@ def render_page() -> None:
     search_text = f1.text_input("Search unit/plate/model", value="")
     selected_models = f2.multiselect("Model", model_options, default=[])
     selected_ca_bucket = f3.selectbox("CA and Cash", ["All", "0", "1", "2+"], index=0)
-    selected_aging_bucket = f4.selectbox("Aging Bucket", ["All", "New (<7)", "Old (>7)", "Boundary (=7)"], index=0)
+    selected_aging_bucket = f4.selectbox("Aging Bucket", ["All", "New (<=7)", "Old (>7)"], index=0)
 
     s1, s2 = st.columns([1.2, 0.9])
     sort_map = {

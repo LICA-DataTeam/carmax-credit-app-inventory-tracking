@@ -323,6 +323,7 @@ def render_page() -> None:
         index=default_end_index,
         format_func=_month_label,
     )
+    search_query = st.text_input("Search Unit/Make/Model/Year/Status")
 
     make_options = sorted(make_model_df["make_name"].dropna().unique().tolist())
     selected_makes = c3.multiselect("Make", make_options, default=[])
@@ -380,6 +381,24 @@ def render_page() -> None:
     if inquiry_df.empty:
         st.info("No inquiry results for the selected filters.")
         return
+
+    if search_query:
+        search_cols = [
+            "unit_full",
+            "unit_alias",
+            "make_name",
+            "model_year",
+            "status",
+        ]
+
+        inquiry_df = inquiry_df[
+            inquiry_df[search_cols]
+            .astype(str)
+            .apply(
+                lambda row: row.str.contains(search_query, case=False, na=False).any(),
+                axis=1
+            )
+        ]
 
     total_client_mentions = int(inquiry_df["client_initiated_mentions"].sum())
     total_agent_mentions = int(inquiry_df["agent_initiated_mentions"].sum())
