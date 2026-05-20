@@ -371,10 +371,10 @@ def render_page() -> None:
         else:
             reference_df_filtered = reference_df
 
-        st.caption(
-            f"Month source column: {month_source_column}. "
-            f"Rows used for matching: {len(reference_df_filtered)}"
-        )
+        # st.caption(
+        #     f"Month source column: {month_source_column}. "
+        #     f"Rows used for matching: {len(reference_df_filtered)}"
+        # )
     else:
         reference_df_filtered = reference_df
         st.caption(
@@ -395,14 +395,14 @@ def render_page() -> None:
         plate_column=plate_number_column,
     )
 
-    plate_label = plate_number_column if plate_number_column else "none detected"
+    # plate_label = plate_number_column if plate_number_column else "none detected"
     st.title("CarMax Inventory Tracking")
-    st.caption(
-        "Dashboard tracks CA and Cash counts against available inventory, with focus on old units (aging > 7 days)."
-    )
-    st.caption(
-        f"Matching mode: plate-first + exact unit fallback | Unit column: {unit_applied_column} | Plate column: {plate_label}"
-    )
+    # st.caption(
+    #     "Dashboard tracks CA and Cash counts against available inventory, with focus on old units (aging > 7 days)."
+    # )
+    # st.caption(
+    #     f"Matching mode: plate-first + exact unit fallback | Unit column: {unit_applied_column} | Plate column: {plate_label}"
+    # )
 
     all_units_df = summary_df.copy()
     all_units_df["ca_and_cash"] = all_units_df["unit_key"].map(app_count_by_unit_key).fillna(0).astype(int)
