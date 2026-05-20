@@ -7,8 +7,8 @@ import streamlit as st
 
 from shared import load_service_account_info, normalize_spreadsheet_id
 
-STATUS_COL_INDEX = 28  # AC
-PLATE_COL_INDEX = 7  # H
+STATUS_COL_INDEX = 8  # STATUS
+PLATE_COL_INDEX = 6  # PLATE NO.
 REFERENCE_MONTH_COL_INDEX = 0  # A (first column) from SECOND_SHEET_SPREADSHEET_ID
 
 
@@ -33,6 +33,54 @@ def _normalize_header_text(value: str) -> str:
 
 def _is_available_status(value: str) -> bool:
     return value.strip().lower() == "available"
+
+
+def _parse_aging_days(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace(",", "")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _apply_table_controls(
+    df: pd.DataFrame,
+    search_text: str,
+    model_filters: list[str],
+    ca_bucket: str,
+    aging_bucket: str,
+) -> pd.DataFrame:
+    filtered = df.copy()
+
+    if search_text:
+        query = search_text.lower().strip()
+        filtered = filtered[
+            filtered["unit"].fillna("").str.lower().str.contains(query)
+            | filtered["plate_number"].fillna("").str.lower().str.contains(query)
+            | filtered["model"].fillna("").str.lower().str.contains(query)
+        ]
+
+    if model_filters:
+        filtered = filtered[filtered["model"].isin(model_filters)]
+
+    if ca_bucket == "0":
+        filtered = filtered[filtered["ca_and_cash"] == 0]
+    elif ca_bucket == "1":
+        filtered = filtered[filtered["ca_and_cash"] == 1]
+    elif ca_bucket == "2+":
+        filtered = filtered[filtered["ca_and_cash"] >= 2]
+
+    if aging_bucket == "New (<7)":
+        filtered = filtered[filtered["aging_days"] < 7]
+    elif aging_bucket == "Old (>7)":
+        filtered = filtered[filtered["aging_days"] > 7]
+    elif aging_bucket == "Boundary (=7)":
+        filtered = filtered[filtered["aging_days"] == 7]
+
+    return filtered
 
 
 @st.cache_resource
@@ -350,24 +398,30 @@ def render_page() -> None:
     plate_label = plate_number_column if plate_number_column else "none detected"
     st.title("CarMax Inventory Tracking")
     st.caption(
-        "Revised view focused on lead coverage targets: each available unit should have at least 2 hot leads and no unit should remain at 0."
+        "Dashboard tracks CA and Cash counts against available inventory, with focus on old units (aging > 7 days)."
     )
     st.caption(
         f"Matching mode: plate-first + exact unit fallback | Unit column: {unit_applied_column} | Plate column: {plate_label}"
     )
 
     all_units_df = summary_df.copy()
-    all_units_df["hot_leads"] = all_units_df["unit_key"].map(app_count_by_unit_key).fillna(0).astype(int)
+    all_units_df["ca_and_cash"] = all_units_df["unit_key"].map(app_count_by_unit_key).fillna(0).astype(int)
 
-    unit_level_df = all_units_df.drop_duplicates(subset=["unit_key"], keep="first").copy()
-    total_units = len(unit_level_df)
-    units_meeting_goal = int((unit_level_df["hot_leads"] >= 2).sum())
-    units_with_1 = int((unit_level_df["hot_leads"] == 1).sum())
-    units_with_0 = int((unit_level_df["hot_leads"] == 0).sum())
-    units_with_credit_apps = int((unit_level_df["hot_leads"] > 0).sum())
-    units_below_goal = int((unit_level_df["hot_leads"] < 2).sum())
-    goal_coverage_pct = (units_meeting_goal / total_units * 100.0) if total_units else 0.0
-    units_with_credit_apps_pct = (units_with_credit_apps / total_units * 100.0) if total_units else 0.0
+    row_level_df = all_units_df.copy()
+    row_level_df["aging_days"] = row_level_df["aging"].map(_parse_aging_days)
+    total_units = len(row_level_df)
+    new_units_df = row_level_df[row_level_df["aging_days"] < 7].copy()
+    old_units_df = row_level_df[row_level_df["aging_days"] > 7].copy()
+    boundary_units_df = row_level_df[row_level_df["aging_days"] == 7].copy()
+
+    total_new_units = int(len(new_units_df))
+    total_old_units = int(len(old_units_df))
+    total_boundary_units = int(len(boundary_units_df))
+    old_units_with_0 = int((old_units_df["ca_and_cash"] == 0).sum())
+    old_units_with_1 = int((old_units_df["ca_and_cash"] == 1).sum())
+    old_units_with_2_plus = int((old_units_df["ca_and_cash"] >= 2).sum())
+    old_units_with_apps = int((old_units_df["ca_and_cash"] > 0).sum())
+    old_units_with_apps_pct = (old_units_with_apps / total_old_units * 100.0) if total_old_units else 0.0
 
     show_match_quality = st.toggle(
         "Show Match Quality (optional)",
@@ -411,94 +465,131 @@ def render_page() -> None:
             {
                 "label": "Total Available Inventory Units",
                 "value": total_units,
-                "sub": "All units currently tagged as Available",
+                "sub": "Unique available inventory units",
                 "tone": "info",
             },
             {
-                "label": "Total Units with Credit Apps",
-                "value": units_with_credit_apps,
-                "sub": f"{units_with_credit_apps_pct:.1f}% of all available units",
+                "label": "New Units",
+                "value": total_new_units,
+                "sub": "Aging < 7 days",
                 "tone": "info",
             },
             {
-                "label": "Units Meeting Goal",
-                "value": units_meeting_goal,
-                "sub": "At least 2 hot leads",
+                "label": "Old Units",
+                "value": total_old_units,
+                "sub": "Aging > 7 days",
                 "tone": "good",
             },
             {
-                "label": "Units Below Goal",
-                "value": units_below_goal,
-                "sub": "0 to 1 hot leads",
+                "label": "Old Units with CA and Cash",
+                "value": old_units_with_apps,
+                "sub": f"{old_units_with_apps_pct:.1f}% of old units",
                 "tone": "warn",
             },
             {
-                "label": "Units with 0 Hot Leads",
-                "value": units_with_0,
-                "sub": "Priority follow-up list",
+                "label": "Aging = 7 Days",
+                "value": total_boundary_units,
+                "sub": "Boundary bucket (excluded from old/new rule)",
                 "tone": "risk",
             },
             {
-                "label": "Coverage Rate",
-                "value": f"{goal_coverage_pct:.1f}%",
-                "sub": "Units currently at >=2 hot leads",
+                "label": "Old Units without CA and Cash",
+                "value": old_units_with_0,
+                "sub": "Old units with zero applications",
                 "tone": "info",
             },
         ],
         columns=3,
     )
-    st.progress(goal_coverage_pct / 100.0, text=f"Coverage progress: {goal_coverage_pct:.1f}%")
+    if total_boundary_units > 0:
+        st.info(
+            f"{total_boundary_units} units have aging exactly 7 days and are not included in old/new buckets to avoid overlap."
+        )
 
-    if units_with_0 == 0:
-        st.success("Goal check: No inventory units are at 0 hot leads.")
-    else:
-        st.warning(f"Goal check: {units_with_0} units are still at 0 hot leads.")
+    st.caption("CA and Cash counts are currently proxied by matched credit-application rows.")
 
-    st.caption("Hot leads are currently proxied by matched credit-application rows.")
-
-    st.markdown("### Lead Distribution")
+    st.markdown("### Old Units Breakdown")
     _render_stat_cards(
         [
             {
-                "label": "Units with >3 Hot Leads",
-                "value": int((unit_level_df["hot_leads"] > 3).sum()),
-                "sub": "Strong demand signal",
-                "tone": "good",
-            },
-            {
-                "label": "Units with 2 Hot Leads",
-                "value": int((unit_level_df["hot_leads"] == 2).sum()),
-                "sub": "At goal threshold",
-                "tone": "info",
-            },
-            {
-                "label": "Units with 1 Hot Lead",
-                "value": units_with_1,
-                "sub": "Needs 1 more lead",
+                "label": "Old Units with 0 CA and Cash",
+                "value": old_units_with_0,
+                "sub": "Aging > 7 and no applications",
                 "tone": "warn",
             },
             {
-                "label": "Units with 0 Hot Leads",
-                "value": units_with_0,
-                "sub": "Critical gap",
+                "label": "Old Units with 1 CA and Cash",
+                "value": old_units_with_1,
+                "sub": "Aging > 7 and one application",
+                "tone": "info",
+            },
+            {
+                "label": "Old Units with 2+ CA and Cash",
+                "value": old_units_with_2_plus,
+                "sub": "Aging > 7 and at least two applications",
+                "tone": "good",
+            },
+            {
+                "label": "Check (Old Bucket Total)",
+                "value": old_units_with_0 + old_units_with_1 + old_units_with_2_plus,
+                "sub": f"Should equal old units: {total_old_units}",
                 "tone": "risk",
             },
         ],
         columns=4,
     )
 
-    below_goal_df = all_units_df[all_units_df["hot_leads"] < 2].copy()
+    all_units_df["aging_days"] = all_units_df["aging"].map(_parse_aging_days)
+    below_goal_df = all_units_df[(all_units_df["aging_days"] > 7) & (all_units_df["ca_and_cash"] < 2)].copy()
     below_goal_df = below_goal_df.sort_values(
-        by=["hot_leads", "aging", "unit", "plate_number"], ascending=[True, False, True, True]
+        by=["ca_and_cash", "aging", "unit", "plate_number"], ascending=[True, False, True, True]
     ).reset_index(drop=True)
 
-    all_units_output = all_units_df.sort_values(
-        by=["hot_leads", "unit", "plate_number"], ascending=[False, True, True]
+    model_options = sorted([m for m in all_units_df["model"].dropna().unique().tolist() if str(m).strip()])
+
+    st.markdown("### Table Controls")
+    f1, f2, f3, f4 = st.columns([1.3, 1.2, 1.0, 1.0])
+    search_text = f1.text_input("Search unit/plate/model", value="")
+    selected_models = f2.multiselect("Model", model_options, default=[])
+    selected_ca_bucket = f3.selectbox("CA and Cash", ["All", "0", "1", "2+"], index=0)
+    selected_aging_bucket = f4.selectbox("Aging Bucket", ["All", "New (<7)", "Old (>7)", "Boundary (=7)"], index=0)
+
+    s1, s2 = st.columns([1.2, 0.9])
+    sort_map = {
+        "CA and Cash": "ca_and_cash",
+        "Aging": "aging_days",
+        "Unit": "unit",
+        "Plate Number": "plate_number",
+        "Model": "model",
+    }
+    selected_sort_label = s1.selectbox("Sort By", list(sort_map.keys()), index=0)
+    sort_desc = s2.toggle("Descending", value=True)
+    sort_column = sort_map[selected_sort_label]
+
+    all_units_filtered = _apply_table_controls(
+        all_units_df,
+        search_text=search_text,
+        model_filters=selected_models,
+        ca_bucket=selected_ca_bucket,
+        aging_bucket=selected_aging_bucket,
+    )
+    below_goal_filtered = _apply_table_controls(
+        below_goal_df,
+        search_text=search_text,
+        model_filters=selected_models,
+        ca_bucket=selected_ca_bucket,
+        aging_bucket=selected_aging_bucket,
+    )
+
+    all_units_output = all_units_filtered.sort_values(
+        by=[sort_column, "unit", "plate_number"],
+        ascending=[not sort_desc, True, True],
     ).rename(
         columns={
             "plate_number": "plate number",
             "acquisition_cost": "acquisition cost",
             "target_selling_price": "target selling price",
+            "ca_and_cash": "ca and cash",
         }
     )[
         [
@@ -508,21 +599,25 @@ def render_page() -> None:
             "acquisition cost",
             "target selling price",
             "aging",
-            "hot_leads",
+            "ca and cash",
         ]
     ]
 
     tab1, tab2 = st.tabs(["Action List (Below Goal)", "All Available Inventory"])
     with tab1:
-        if below_goal_df.empty:
-            st.success("No units below goal. All inventory units have at least 2 hot leads.")
+        if below_goal_filtered.empty:
+            st.success("No old units below goal. All old units have at least 2 CA and Cash.")
         else:
-            st.markdown("#### Units Below Goal (0-1 hot leads)")
-            below_goal_output = below_goal_df.rename(
+            st.markdown("#### Old Units Below Goal (0-1 CA and Cash, aging > 7)")
+            below_goal_output = below_goal_filtered.sort_values(
+                by=[sort_column, "unit", "plate_number"],
+                ascending=[not sort_desc, True, True],
+            ).rename(
                 columns={
                     "plate_number": "plate number",
                     "acquisition_cost": "acquisition cost",
                     "target_selling_price": "target selling price",
+                    "ca_and_cash": "ca and cash",
                 }
             )[
                 [
@@ -532,14 +627,14 @@ def render_page() -> None:
                     "acquisition cost",
                     "target selling price",
                     "aging",
-                    "hot_leads",
+                    "ca and cash",
                 ]
             ]
             st.dataframe(
                 below_goal_output,
                 use_container_width=True,
                 hide_index=True,
-                column_config={"hot_leads": st.column_config.NumberColumn("hot leads")},
+                column_config={"ca and cash": st.column_config.NumberColumn("ca and cash")},
             )
 
     with tab2:
@@ -547,7 +642,7 @@ def render_page() -> None:
             all_units_output,
             use_container_width=True,
             hide_index=True,
-            column_config={"hot_leads": st.column_config.NumberColumn("hot leads")},
+            column_config={"ca and cash": st.column_config.NumberColumn("ca and cash")},
         )
 
     st.download_button(

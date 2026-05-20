@@ -13,7 +13,7 @@ import gspread
 from shared import load_service_account_info, normalize_spreadsheet_id
 
 BQ_VIEW = st.secrets["BQ_VIEW"]
-STATUS_COL_INDEX = 28  # AC
+STATUS_COL_INDEX = 8  # STATUS
 
 
 def _month_label(value: date) -> str:
